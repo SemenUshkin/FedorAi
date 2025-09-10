@@ -7,6 +7,7 @@ import requests
 from flask import Flask, request, jsonify
 from telegram import Bot, Update
 import json
+import httpx
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +24,68 @@ WEBHOOK_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://fedorai.onrender.com')
 
 # Инициализация
 openai.api_key = OPENAI_API_KEY
-bot = Bot(token=TELEGRAM_TOKEN)
+
+# Глобальный клиент для Telegram API
+telegram_client = None
+
+def get_telegram_client():
+    """Получение единого HTTP клиента"""
+    global telegram_client
+    if telegram_client is None:
+        # Создаем клиент с увеличенными лимитами
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        timeout = httpx.Timeout(30.0)
+        telegram_client = httpx.AsyncClient(limits=limits, timeout=timeout)
+    return telegram_client
+
+async def send_telegram_message(chat_id, text, reply_to_message_id=None):
+    """Отправка сообщения через Telegram API"""
+    try:
+        client = get_telegram_client()
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        
+        if reply_to_message_id:
+            data["reply_to_message_id"] = reply_to_message_id
+        
+        response = await client.post(url, json=data)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get('result', {}).get('message_id')
+        else:
+            logger.error(f"Ошибка отправки сообщения: {response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Ошибка Telegram API: {e}")
+        return None
+
+async def edit_telegram_message(chat_id, message_id, text):
+    """Редактирование сообщения через Telegram API"""
+    try:
+        client = get_telegram_client()
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }
+        
+        response = await client.post(url, json=data)
+        
+        if response.status_code != 200:
+            logger.error(f"Ошибка редактирования сообщения: {response.text}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка редактирования: {e}")
 
 async def process_with_chatgpt(text):
     """Обработка через ChatGPT"""
@@ -98,7 +160,7 @@ async def save_to_google_sheet(username, user_id, original_text, processed_text)
 async def handle_message(update_data):
     """Обработка сообщения"""
     try:
-        update = Update.de_json(update_data, bot)
+        update = Update.de_json(update_data, None)
         
         if not update.message:
             return
@@ -106,46 +168,49 @@ async def handle_message(update_data):
         message = update.message
         text = message.text
         user = message.from_user
+        chat_id = message.chat_id
         
         logger.info(f"Получено сообщение от {user.username}: {text}")
         
         # Команды
         if text == '/start':
-            response_text = """
-🤖 Добро пожаловать в бота для обработки идей!
+            response_text = """🤖 *Федя, привет!*
 
 Я могу:
 • 💬 Принимать текстовые сообщения  
 • 🧠 Обрабатывать их через ChatGPT
 • 📊 Сохранять результаты
 
-Просто отправьте мне текстовое сообщение!
-            """
-            await bot.send_message(chat_id=message.chat_id, text=response_text)
+Просто отправьте мне текстовое сообщение!"""
+            
+            await send_telegram_message(chat_id, response_text)
             return
             
         elif text == '/help':
-            response_text = """
-📋 Как использовать бота:
+            response_text = """📋 *Как использовать бота:*
 
 1. Отправьте любую идею или задачу
 2. Бот обработает её через ChatGPT  
 3. Получите структурированный ответ
 
-Команды:
+*Команды:*
 • /start - начать работу
-• /help - эта справка
-            """
-            await bot.send_message(chat_id=message.chat_id, text=response_text)
+• /help - эта справка"""
+            
+            await send_telegram_message(chat_id, response_text)
             return
         
         # Обработка обычного сообщения
         if text and not text.startswith('/'):
             # Уведомление о начале обработки
-            processing_msg = await bot.send_message(
-                chat_id=message.chat_id, 
-                text="💭 Обрабатываю через ChatGPT..."
+            processing_msg_id = await send_telegram_message(
+                chat_id, 
+                "💭 Обрабатываю через ChatGPT..."
             )
+            
+            if not processing_msg_id:
+                logger.error("Не удалось отправить сообщение о начале обработки")
+                return
             
             # Обработка через ChatGPT
             processed_text = await process_with_chatgpt(text)
@@ -160,18 +225,12 @@ async def handle_message(update_data):
                 )
             
             # Отправка результата
-            result_text = f"""
-✅ **Сообщение обработано!**
+            result_text = f"""✅ *Сообщение обработано!*
 
-💭 **Обработанная мысль:**
-{processed_text}
-            """
+💭 *Обработанная мысль:*
+{processed_text}"""
             
-            await bot.edit_message_text(
-                chat_id=message.chat_id,
-                message_id=processing_msg.message_id,
-                text=result_text
-            )
+            await edit_telegram_message(chat_id, processing_msg_id, result_text)
             
             logger.info(f"Сообщение обработано для {user.username}")
             
@@ -220,15 +279,19 @@ async def setup_webhook():
         webhook_url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
         logger.info(f"Устанавливаем webhook: {webhook_url}")
         
-        result = await bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=["message"]
-        )
+        client = get_telegram_client()
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        data = {
+            "url": webhook_url,
+            "allowed_updates": ["message"]
+        }
         
-        if result:
+        response = await client.post(url, json=data)
+        
+        if response.status_code == 200:
             logger.info("✅ Webhook успешно установлен")
         else:
-            logger.error("❌ Не удалось установить webhook")
+            logger.error(f"❌ Не удалось установить webhook: {response.text}")
             
     except Exception as e:
         logger.error(f"Ошибка установки webhook: {e}")
