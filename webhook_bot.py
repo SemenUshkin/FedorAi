@@ -5,9 +5,7 @@ from datetime import datetime
 import openai
 import requests
 from flask import Flask, request, jsonify
-from telegram import Bot, Update
 import json
-import httpx
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -25,24 +23,9 @@ WEBHOOK_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://fedorai.onrender.com')
 # Инициализация
 openai.api_key = OPENAI_API_KEY
 
-# Глобальный клиент для Telegram API
-telegram_client = None
-
-def get_telegram_client():
-    """Получение единого HTTP клиента"""
-    global telegram_client
-    if telegram_client is None:
-        # Создаем клиент с увеличенными лимитами
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        timeout = httpx.Timeout(30.0)
-        telegram_client = httpx.AsyncClient(limits=limits, timeout=timeout)
-    return telegram_client
-
-async def send_telegram_message(chat_id, text, reply_to_message_id=None):
-    """Отправка сообщения через Telegram API"""
+def send_telegram_message_sync(chat_id, text, reply_to_message_id=None):
+    """Синхронная отправка сообщения через Telegram API"""
     try:
-        client = get_telegram_client()
-        
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = {
             "chat_id": chat_id,
@@ -53,7 +36,7 @@ async def send_telegram_message(chat_id, text, reply_to_message_id=None):
         if reply_to_message_id:
             data["reply_to_message_id"] = reply_to_message_id
         
-        response = await client.post(url, json=data)
+        response = requests.post(url, json=data, timeout=30)
         
         if response.status_code == 200:
             result = response.json()
@@ -66,11 +49,9 @@ async def send_telegram_message(chat_id, text, reply_to_message_id=None):
         logger.error(f"Ошибка Telegram API: {e}")
         return None
 
-async def edit_telegram_message(chat_id, message_id, text):
-    """Редактирование сообщения через Telegram API"""
+def edit_telegram_message_sync(chat_id, message_id, text):
+    """Синхронное редактирование сообщения через Telegram API"""
     try:
-        client = get_telegram_client()
-        
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
         data = {
             "chat_id": chat_id,
@@ -79,7 +60,7 @@ async def edit_telegram_message(chat_id, message_id, text):
             "parse_mode": "Markdown"
         }
         
-        response = await client.post(url, json=data)
+        response = requests.post(url, json=data, timeout=30)
         
         if response.status_code != 200:
             logger.error(f"Ошибка редактирования сообщения: {response.text}")
@@ -87,13 +68,12 @@ async def edit_telegram_message(chat_id, message_id, text):
     except Exception as e:
         logger.error(f"Ошибка редактирования: {e}")
 
-async def process_with_chatgpt(text):
-    """Обработка через ChatGPT"""
+def process_with_chatgpt_sync(text):
+    """Синхронная обработка через ChatGPT"""
     try:
         logger.info("Отправка запроса в OpenAI...")
         
-        response = await asyncio.to_thread(
-            openai.ChatCompletion.create,
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
                 {
@@ -126,8 +106,8 @@ async def process_with_chatgpt(text):
         logger.error(f"Ошибка OpenAI: {e}")
         return f"Ошибка обработки через ChatGPT: {e}\n\nИсходный текст: {text}"
 
-async def save_to_google_sheet(username, user_id, original_text, processed_text):
-    """Сохранение в Google таблицу"""
+def save_to_google_sheet_sync(username, user_id, original_text, processed_text):
+    """Синхронное сохранение в Google таблицу"""
     try:
         if not GOOGLE_SCRIPT_URL:
             logger.info("Google Script URL не настроен")
@@ -142,12 +122,7 @@ async def save_to_google_sheet(username, user_id, original_text, processed_text)
             'processed_text': processed_text
         }
         
-        response = await asyncio.to_thread(
-            requests.post,
-            GOOGLE_SCRIPT_URL,
-            json=data,
-            timeout=10
-        )
+        response = requests.post(GOOGLE_SCRIPT_URL, json=data, timeout=10)
         
         if response.status_code == 200:
             logger.info("Данные сохранены в Google таблицу")
@@ -157,24 +132,29 @@ async def save_to_google_sheet(username, user_id, original_text, processed_text)
     except Exception as e:
         logger.error(f"Ошибка Google Sheets: {e}")
 
-async def handle_message(update_data):
+def handle_message(update_data):
     """Обработка сообщения"""
     try:
-        update = Update.de_json(update_data, None)
-        
-        if not update.message:
+        # Простой парсинг JSON без telegram библиотеки
+        if not update_data.get('message'):
             return
             
-        message = update.message
-        text = message.text
-        user = message.from_user
-        chat_id = message.chat_id
+        message = update_data['message']
+        text = message.get('text')
+        user = message.get('from', {})
+        chat_id = message.get('chat', {}).get('id')
         
-        logger.info(f"Получено сообщение от {user.username}: {text}")
+        if not text or not chat_id:
+            return
+            
+        username = user.get('username') or user.get('first_name', 'Unknown')
+        user_id = user.get('id')
+        
+        logger.info(f"Получено сообщение от {username}: {text}")
         
         # Команды
         if text == '/start':
-            response_text = """🤖 *Федя, привет!*
+            response_text = """🤖 *Добро пожаловать в бота для обработки идей!*
 
 Я могу:
 • 💬 Принимать текстовые сообщения  
@@ -183,7 +163,7 @@ async def handle_message(update_data):
 
 Просто отправьте мне текстовое сообщение!"""
             
-            await send_telegram_message(chat_id, response_text)
+            send_telegram_message_sync(chat_id, response_text)
             return
             
         elif text == '/help':
@@ -197,13 +177,13 @@ async def handle_message(update_data):
 • /start - начать работу
 • /help - эта справка"""
             
-            await send_telegram_message(chat_id, response_text)
+            send_telegram_message_sync(chat_id, response_text)
             return
         
         # Обработка обычного сообщения
         if text and not text.startswith('/'):
             # Уведомление о начале обработки
-            processing_msg_id = await send_telegram_message(
+            processing_msg_id = send_telegram_message_sync(
                 chat_id, 
                 "💭 Обрабатываю через ChatGPT..."
             )
@@ -213,13 +193,13 @@ async def handle_message(update_data):
                 return
             
             # Обработка через ChatGPT
-            processed_text = await process_with_chatgpt(text)
+            processed_text = process_with_chatgpt_sync(text)
             
             # Сохранение в Google таблицу
             if GOOGLE_SCRIPT_URL:
-                await save_to_google_sheet(
-                    username=user.username or user.first_name,
-                    user_id=user.id,
+                save_to_google_sheet_sync(
+                    username=username,
+                    user_id=user_id,
                     original_text=text,
                     processed_text=processed_text
                 )
@@ -230,9 +210,9 @@ async def handle_message(update_data):
 💭 *Обработанная мысль:*
 {processed_text}"""
             
-            await edit_telegram_message(chat_id, processing_msg_id, result_text)
+            edit_telegram_message_sync(chat_id, processing_msg_id, result_text)
             
-            logger.info(f"Сообщение обработано для {user.username}")
+            logger.info(f"Сообщение обработано для {username}")
             
     except Exception as e:
         logger.error(f"Ошибка обработки сообщения: {e}")
@@ -244,11 +224,8 @@ def webhook():
         json_data = request.get_json()
         
         if json_data:
-            # Создаем event loop для async функций
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(handle_message(json_data))
-            loop.close()
+            # Обрабатываем синхронно без event loop
+            handle_message(json_data)
             
         return jsonify({'status': 'ok'}), 200
         
@@ -273,20 +250,19 @@ def index():
         'status': 'active'
     }), 200
 
-async def setup_webhook():
+def setup_webhook():
     """Установка webhook"""
     try:
         webhook_url = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
         logger.info(f"Устанавливаем webhook: {webhook_url}")
         
-        client = get_telegram_client()
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
         data = {
             "url": webhook_url,
             "allowed_updates": ["message"]
         }
         
-        response = await client.post(url, json=data)
+        response = requests.post(url, json=data, timeout=30)
         
         if response.status_code == 200:
             logger.info("✅ Webhook успешно установлен")
@@ -296,18 +272,11 @@ async def setup_webhook():
     except Exception as e:
         logger.error(f"Ошибка установки webhook: {e}")
 
-def run_webhook_setup():
-    """Запуск установки webhook"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(setup_webhook())
-    loop.close()
-
 if __name__ == '__main__':
     logger.info("Инициализация webhook бота...")
     
     # Установка webhook
-    run_webhook_setup()
+    setup_webhook()
     
     # Запуск Flask сервера
     port = int(os.environ.get("PORT", 5000))
